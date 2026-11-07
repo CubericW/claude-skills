@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Manage Obsidian vaults from the command line.
+
+    obsidian-vault list [--json]              registered vaults (name, open state, path)
+    obsidian-vault add <folder>               register an existing folder as a vault and open it
+    obsidian-vault create <folder>            create a new folder and open it as a vault
+    obsidian-vault open <name|path>           open (or focus) a registered vault
+    obsidian-vault close <name|path>          close a vault's window
+    obsidian-vault remove <name|path> [--close]   unregister a vault (files are kept)
+    obsidian-vault move <name|path> <new-folder>  rename/move a closed vault's folder
+
+The official `obsidian` CLI drives everything inside a vault but cannot register
+vaults. This helper calls the IPC channels Obsidian's own vault switcher uses
+(vault-list / vault-open / vault-remove / vault-move) through `obsidian eval`,
+so the running app stays the only writer of obsidian.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+OBSIDIAN = shutil.which("obsidian") or "/usr/local/bin/obsidian"
+CONFIG = os.path.expanduser("~/Library/Application Support/obsidian/obsidian.json")
+
+
+class Fail(Exception):
+    pass
+
+
+def cli(*args: str, timeout: float = 30) -> str:
+    """Run the official CLI. It exits 0 even on errors, so callers inspect the text."""
+    try:
+        proc = subprocess.run([OBSIDIAN, *args], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise Fail("Obsidian CLI not found: enable Settings → General → Command line interface in Obsidian") from None
+    except subprocess.TimeoutExpired:
+        raise Fail(f"`obsidian {args[0]}` timed out") from None
+    out = (proc.stdout + proc.stderr).strip()
+    if "unable to find Obsidian" in out:
+        raise Fail("Obsidian is not running")
+    return out
+
+
+def app_running() -> bool:
+    try:
+        return not cli("version", timeout=10).startswith("Error")
+    except Fail:
+        return False
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def ensure_app() -> None:
+    if app_running():
+        return
+    subprocess.run(["open", "-g", "-a", "Obsidian"], check=False)
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        time.sleep(1.5)
+        if app_running():
+            return
+    raise Fail("Obsidian did not start; open it manually and retry")
+
+
+def ipc(channel: str, *params):
+    """Call a main-process IPC channel from the active vault window and return its value."""
+    js_args = ", ".join(json.dumps(p, ensure_ascii=False) for p in (channel, *params))
+    code = f"JSON.stringify(require('electron').ipcRenderer.sendSync({js_args}))"
+    for attempt in (1, 2):
+        out = cli("eval", f"code={code}")
+        # a waiting CLI call can also print other clients' "Received CLI command" lines
+        results = [line[3:] for line in out.splitlines() if line.startswith("=> ")]
+        if results:
+            return json.loads(results[-1])
+        if attempt == 1 and _open_any_vault():
+            continue  # eval needs a vault window; retry once after opening one
+        raise Fail(f"Obsidian eval failed: {out}")
+
+
+def _open_any_vault() -> bool:
+    """Open the most recently used vault when no vault window is available for eval."""
+    vaults = load_config().get("vaults", {})
+    if not vaults:
+        return False
+    vid = max(vaults, key=lambda k: vaults[k].get("ts", 0))
+    subprocess.run(["open", "-g", f"obsidian://open?vault={vid}"], check=False)
+    time.sleep(4)
+    return True
+
+
+def vault_list() -> dict:
+    return ipc("vault-list") or {}
+
+
+def resolve(ref: str, vaults: dict) -> str:
+    """Map a vault name (folder basename, as `obsidian vaults` shows) or path to its registered path."""
+    path = os.path.abspath(os.path.expanduser(ref))
+    if any(v["path"] == path for v in vaults.values()):
+        return path
+    matches = [v["path"] for v in vaults.values() if os.path.basename(v["path"]) == ref]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise Fail(f"no registered vault named or located at {ref!r}; see `obsidian-vault list`")
+    raise Fail(f"{len(matches)} vaults are named {ref!r}; pass the full path instead")
+
+
+def is_open(path: str, vaults: dict) -> bool:
+    return any(v["path"] == path and v.get("open") for v in vaults.values())
+
+
+def warn_duplicate_name(path: str, vaults: dict) -> None:
+    name = os.path.basename(path)
+    if sum(os.path.basename(v["path"]) == name for v in vaults.values()) > 1:
+        print(f"warning: several vaults are named {name!r}; `obsidian vault={name} ...` may pick the wrong one",
+              file=sys.stderr)
+
+
+def close_window(path: str, vaults: dict) -> None:
+    name = os.path.basename(path)
+    if sum(os.path.basename(v["path"]) == name for v in vaults.values()) > 1:
+        raise Fail(f"several vaults are named {name!r}; close {path} from Obsidian itself")
+    out = cli(f"vault={name}", "command", "id=workspace:close-window")
+    if not out.startswith("Executed"):
+        raise Fail(f"could not close {name!r}: {out}")
+    for _ in range(20):
+        time.sleep(0.5)
+        if not is_open(path, vault_list()):
+            return
+    raise Fail(f"{name!r} still reports open")
+
+
+def cmd_list(args) -> None:
+    if app_running():
+        vaults = vault_list()
+    else:
+        vaults = load_config().get("vaults", {})  # read-only fallback; don't launch the app just to list
+    rows = sorted(vaults.values(), key=lambda v: -v.get("ts", 0))
+    if args.json:
+        print(json.dumps([{"name": os.path.basename(v["path"]), "open": bool(v.get("open")),
+                           "path": v["path"], "exists": os.path.isdir(v["path"])} for v in rows],
+                         ensure_ascii=False, indent=1))
+        return
+    for v in rows:
+        state = "open" if v.get("open") else "closed"
+        missing = "" if os.path.isdir(v["path"]) else "\t(folder missing)"
+        print(f"{os.path.basename(v['path'])}\t{state}\t{v['path']}{missing}")
+
+
+def cmd_add(args) -> None:
+    path = os.path.abspath(os.path.expanduser(args.folder))
+    if not os.path.isdir(path):
+        raise Fail(f"{path} is not an existing folder (use `create` for a brand-new vault)")
+    ensure_app()
+    result = ipc("vault-open", path, False)
+    if result is not True:
+        raise Fail(f"Obsidian refused: {result}")
+    warn_duplicate_name(path, vault_list())
+    print(f"Added and opened vault {os.path.basename(path)!r} at {path}")
+
+
+def cmd_create(args) -> None:
+    path = os.path.abspath(os.path.expanduser(args.folder))
+    if os.path.exists(path):
+        raise Fail(f"{path} already exists (use `add` to register an existing folder)")
+    ensure_app()
+    result = ipc("vault-open", path, True)
+    if result is not True:
+        raise Fail(f"Obsidian refused: {result}")
+    warn_duplicate_name(path, vault_list())
+    print(f"Created and opened vault {os.path.basename(path)!r} at {path}")
+
+
+def cmd_open(args) -> None:
+    ensure_app()
+    path = resolve(args.vault, vault_list())
+    result = ipc("vault-open", path, False)
+    if result is not True:
+        raise Fail(f"Obsidian refused: {result}")
+    print(f"Opened {os.path.basename(path)!r}")
+
+
+def cmd_close(args) -> None:
+    ensure_app()
+    vaults = vault_list()
+    path = resolve(args.vault, vaults)
+    if not is_open(path, vaults):
+        print(f"{os.path.basename(path)!r} is not open")
+        return
+    close_window(path, vaults)
+    print(f"Closed {os.path.basename(path)!r}")
+
+
+def cmd_remove(args) -> None:
+    ensure_app()
+    vaults = vault_list()
+    path = resolve(args.vault, vaults)
+    if is_open(path, vaults):
+        if not args.close:
+            raise Fail(f"{os.path.basename(path)!r} is open; pass --close to close its window first")
+        close_window(path, vaults)
+    if ipc("vault-remove", path) is not True:
+        raise Fail("Obsidian refused to remove it (is its window still open?)")
+    print(f"Removed {os.path.basename(path)!r} from Obsidian's vault list; files kept at {path}")
+
+
+def cmd_move(args) -> None:
+    ensure_app()
+    vaults = vault_list()
+    path = resolve(args.vault, vaults)
+    dest = os.path.abspath(os.path.expanduser(args.new_folder))
+    if os.path.exists(dest):
+        raise Fail(f"{dest} already exists")
+    if is_open(path, vaults):
+        raise Fail(f"close the vault first: obsidian-vault close {os.path.basename(path)!r}")
+    result = ipc("vault-move", path, dest)
+    if result != "":
+        raise Fail(f"Obsidian refused: {result}")
+    print(f"Moved vault {path} -> {dest}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="obsidian-vault", description="Manage Obsidian vaults via the running app.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("list", help="list registered vaults")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_list)
+    p = sub.add_parser("add", help="register an existing folder as a vault and open it")
+    p.add_argument("folder")
+    p.set_defaults(fn=cmd_add)
+    p = sub.add_parser("create", help="create a new folder and open it as a vault")
+    p.add_argument("folder")
+    p.set_defaults(fn=cmd_create)
+    p = sub.add_parser("open", help="open or focus a registered vault")
+    p.add_argument("vault")
+    p.set_defaults(fn=cmd_open)
+    p = sub.add_parser("close", help="close a vault's window")
+    p.add_argument("vault")
+    p.set_defaults(fn=cmd_close)
+    p = sub.add_parser("remove", help="unregister a vault (its files are kept)")
+    p.add_argument("vault")
+    p.add_argument("--close", action="store_true", help="close its window first if it is open")
+    p.set_defaults(fn=cmd_remove)
+    p = sub.add_parser("move", help="rename/move a closed vault's folder")
+    p.add_argument("vault")
+    p.add_argument("new_folder")
+    p.set_defaults(fn=cmd_move)
+    args = parser.parse_args(argv)
+    try:
+        args.fn(args)
+    except Fail as exc:
+        print(f"obsidian-vault: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

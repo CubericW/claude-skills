@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to ~/.config/video-digest/config.json. Every key is optional.",
+  "output_dir": "~/video-digest",
+  "cookies_from_browser": "chrome",
+  "cookies_file": null,
+  "cookie_sites": ["bilibili.com", "b23.tv", "douyin.com", "iesdouyin.com", "xiaohongshu.com",
+                   "xhslink.com", "kuaishou.com", "weibo.com", "weibo.cn"],
+  "max_height": 720,
+  "visual": "auto",
+  "burned_subs": "auto",
+  "burned_subs_max_minutes": 20,
+  "visual_max_minutes": 180,
+  "max_frames": 80,
+  "asr_engine": "auto",
+  "asr_model": null,
+  "ocr_langs": "zh-Hans,en-US",
+  "keep_media": false,
+  "proxy": null,
+  "ytdlp": "auto"
+}

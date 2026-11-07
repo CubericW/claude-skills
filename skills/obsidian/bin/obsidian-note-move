@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Move or rename a note or folder in an Obsidian vault without hanging on the "Update links" dialog.
+
+    obsidian-note-move VAULT SRC DEST [--links update|keep]
+
+SRC and DEST are paths relative to the vault root ("Inbox/Idea.md"). A DEST ending in "/" is a
+folder and keeps the original name; a missing ".md" is added back. Missing parent folders are
+created. Obsidian's own rename is used, so links change exactly as the app would change them.
+
+When a vault's "Automatically update internal links" setting is off, Obsidian asks whether to
+update links and the official CLI blocks until someone answers. This helper answers the dialog:
+--links update (default) = "Just this once", --links keep = "Don't update". It never clicks
+"Always update", which would change the user's setting.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+
+OBSIDIAN = shutil.which("obsidian") or "/usr/local/bin/obsidian"
+
+JS = """(async () => {
+  const src = %(src)s, choice = %(choice)d;
+  let dest = %(dest)s;
+  const file = app.vault.getAbstractFileByPath(src);
+  if (!file) return JSON.stringify({ok: false, error: 'not found: ' + src});
+  if (dest.endsWith('/')) dest += file.name;
+  if (file.extension && !dest.endsWith('.' + file.extension)) dest += '.' + file.extension;
+  if (app.vault.getAbstractFileByPath(dest)) return JSON.stringify({ok: false, error: 'destination exists: ' + dest});
+  const parent = dest.includes('/') ? dest.slice(0, dest.lastIndexOf('/')) : '';
+  if (parent && !app.vault.getAbstractFileByPath(parent)) await app.vault.createFolder(parent);
+  const earlier = new Set(document.querySelectorAll('.modal-container'));
+  let settled = false, answered = null;
+  const done = app.fileManager.renameFile(file, dest).then(() => { settled = true; });
+  for (let i = 0; i < 100 && !settled; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    const modal = [...document.querySelectorAll('.modal-container.mod-confirmation')].find(m => !earlier.has(m));
+    const buttons = modal ? modal.querySelectorAll('.modal-button-container button') : [];
+    if (buttons.length === 3 && answered === null) { answered = buttons[choice].textContent; buttons[choice].click(); }
+  }
+  await done;
+  return JSON.stringify({ok: true, from: src, to: dest, linkDialog: answered});
+})()"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="obsidian-note-move", description=__doc__.split("\n\n")[0])
+    parser.add_argument("vault", help="vault name, as `obsidian-vault list` shows it")
+    parser.add_argument("src", help="current path relative to the vault root")
+    parser.add_argument("dest", help="new path relative to the vault root; end with / to keep the name")
+    parser.add_argument("--links", choices=("update", "keep"), default="update",
+                        help="answer to the 'Update links' dialog if it appears (default: update)")
+    args = parser.parse_args(argv)
+
+    code = JS % {
+        "src": json.dumps(args.src, ensure_ascii=False),
+        "dest": json.dumps(args.dest, ensure_ascii=False),
+        "choice": 1 if args.links == "update" else 2,
+    }
+    try:
+        proc = subprocess.run([OBSIDIAN, f"vault={args.vault}", "eval", f"code={code}"],
+                              capture_output=True, text=True, timeout=180)
+    except FileNotFoundError:
+        print("obsidian-note-move: Obsidian CLI not found", file=sys.stderr)
+        return 1
+    except subprocess.TimeoutExpired:
+        print("obsidian-note-move: timed out; check Obsidian for an open dialog", file=sys.stderr)
+        return 1
+    out = (proc.stdout + proc.stderr).strip()
+    results = [line[3:] for line in out.splitlines() if line.startswith("=> ")]
+    if not results:
+        print(f"obsidian-note-move: {out or 'no output'}", file=sys.stderr)
+        return 1
+    result = json.loads(results[-1])
+    if not result.get("ok"):
+        print(f"obsidian-note-move: {result.get('error')}", file=sys.stderr)
+        return 1
+    note = f" (answered link dialog: {result['linkDialog']})" if result.get("linkDialog") else ""
+    print(f"Moved {result['from']} -> {result['to']}{note}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
